@@ -1,8 +1,10 @@
 import express from 'express';
+import cors from 'cors';
 import Database from 'better-sqlite3';
 
 const app = express();
 
+app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
@@ -16,6 +18,8 @@ const db = new Database('./clients.db');
 const closeDb = () => db.close();
 process.on('SIGTERM', closeDb);
 process.on('SIGINT', closeDb);
+
+const VALID_STATUSES = ['backlog', 'in-progress', 'complete'];
 
 /**
  * Validate id input
@@ -73,16 +77,16 @@ app.get('/api/v1/clients', (req, res) => {
   const status = req.query.status;
   if (status) {
     // status can only be either 'backlog' | 'in-progress' | 'complete'
-    if (status !== 'backlog' && status !== 'in-progress' && status !== 'complete') {
+    if (!VALID_STATUSES.includes(status)) {
       return res.status(400).send({
         'message': 'Invalid status provided.',
         'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
       });
     }
-    const clients = db.prepare('select * from clients where status = ?').all(status);
+    const clients = db.prepare('select * from clients where status = ? order by priority').all(status);
     return res.status(200).send(clients);
   }
-  const statement = db.prepare('select * from clients');
+  const statement = db.prepare('select * from clients order by priority');
   const clients = statement.all();
   return res.status(200).send(clients);
 });
@@ -95,7 +99,7 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
@@ -115,20 +119,59 @@ app.get('/api/v1/clients/:id', (req, res) => {
  *
  */
 app.put('/api/v1/clients/:id', (req, res) => {
-  const id = parseInt(req.params.id , 10);
+  const id = parseInt(req.params.id, 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
-  let { status, priority } = req.body;
-  let clients = db.prepare('select * from clients').all();
-  const client = clients.find(client => client.id === id);
+  const { status, priority } = req.body;
+  const client = db.prepare('select * from clients where id = ?').get(id);
 
-  /* ---------- Update code below ----------*/
+  if (status !== undefined && !VALID_STATUSES.includes(status)) {
+    return res.status(400).send({
+      message: 'Invalid status provided.',
+      long_message: 'Status can only be one of the following: [backlog | in-progress | complete].',
+    });
+  }
+  if (priority !== undefined && (!Number.isInteger(priority) || priority < 1)) {
+    return res.status(400).send({
+      message: 'Invalid priority provided.',
+      long_message: 'Priority can only be positive integer.',
+    });
+  }
 
+  const newStatus = status ?? client.status;
 
+  // Nothing to change
+  const samePlace = newStatus === client.status && (priority === undefined || priority === client.priority);
 
+  if (!samePlace) {
+    const move = db.transaction(() => {
+      // Other cards in the destination column (excluding this one)
+      const { n } = db
+        .prepare('select count(*) as n from clients where status = ? and id != ?')
+        .get(newStatus, id);
+
+      // No priority given => bottom of the column; otherwise clamp so there are no gaps
+      const newPriority = priority === undefined ? n + 1 : Math.min(priority, n + 1);
+
+      // 1. Close the gap left behind in the old column
+      db.prepare('update clients set priority = priority - 1 where status = ? and priority > ?')
+        .run(client.status, client.priority);
+
+      // 2. Open a slot in the destination column
+      db.prepare('update clients set priority = priority + 1 where status = ? and priority >= ? and id != ?')
+        .run(newStatus, newPriority, id);
+
+      // 3. Place the card
+      db.prepare('update clients set status = ?, priority = ? where id = ?')
+        .run(newStatus, newPriority, id);
+    });
+    move();
+  }
+
+  const clients = db.prepare('select * from clients order by status, priority').all();
   return res.status(200).send(clients);
 });
 
